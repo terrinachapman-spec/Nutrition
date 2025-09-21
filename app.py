@@ -1,144 +1,154 @@
-# TGK Meal Builder - Streamlit (Corrected)
+# TGK Weekly Nutrition Planner - Streamlit
 import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.optimize import lsq_linear
-import io, os
+import io, os, random
 
 DEFAULT_EXCEL = "concise-14-edition.xlsx"
 
 # ---------- Helpers ----------
-@st.cache_data
-def load_foods_from_fileobj(fileobj):
-    fileobj.seek(0)
-    df = pd.read_excel(fileobj, sheet_name=0)
-    return normalize_foods_df(df)
-
-@st.cache_data
-def load_foods_from_path(path):
-    if not os.path.exists(path):
-        st.error(f"Food database not found at: {path}")
-        return pd.DataFrame(columns=['name','brand','serving_grams','calories','protein_g','carbs_g','fat_g',
-                                     'kcal_per_g','prot_per_g','carb_per_g','fat_per_g'])
-    df = pd.read_excel(path, sheet_name=0)
-    return normalize_foods_df(df)
-
 def normalize_foods_df(df):
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
     lc = {c.lower(): c for c in df.columns}
-
-    def find_column(possible):
-        for p in possible:
-            if p in lc:
-                return lc[p]
-        return None
-
-    name_col = find_column(['name','foodname','food name','description']) or df.columns[0]
-    calories_col = find_column(['calories','kcal','energy (kcal)','energy_kcal'])
-    protein_col = find_column(['protein','protein_g','protein (g)'])
-    carbs_col = find_column(['carbs','carbohydrate','carbs_g','carbs (g)'])
-    fat_col = find_column(['fat','fat_g','fat (g)'])
-    serving_col = find_column(['serving_grams','serving_g','grams','serve_g'])
-
+    def get(colnames, default=None):
+        for c in colnames:
+            if c in lc: return lc[c]
+        return default
     out = pd.DataFrame()
-    out['name'] = df[name_col].astype(str)
-    out['brand'] = df[lc.get('brand','brand')] if 'brand' in lc else ""
-
-    def get_num(col):
-        if col and col in df.columns:
-            return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        else:
-            return pd.Series(0.0, index=df.index)
-
-    out['calories'] = get_num(calories_col)
-    out['protein_g'] = get_num(protein_col)
-    out['carbs_g'] = get_num(carbs_col)
-    out['fat_g'] = get_num(fat_col)
-    out['serving_grams'] = get_num(serving_col)
-
-    def per_gram(val, serving):
-        vals = []
-        for v,s in zip(val,serving):
-            if s>0:
-                vals.append(v/s)
-            else:
-                vals.append(v/100.0)
-        return pd.Series(vals, index=val.index)
-
-    out['kcal_per_g'] = per_gram(out['calories'], out['serving_grams'])
-    out['prot_per_g'] = per_gram(out['protein_g'], out['serving_grams'])
-    out['carb_per_g'] = per_gram(out['carbs_g'], out['serving_grams'])
-    out['fat_per_g'] = per_gram(out['fat_g'], out['serving_grams'])
-
+    out["name"] = df[get(["name","foodname","description"],df.columns[0])].astype(str)
+    out["brand"] = df[get(["brand"],None)] if get(["brand"],None) else ""
+    def num(colnames):
+        col=get(colnames)
+        return pd.to_numeric(df[col],errors="coerce").fillna(0.0) if col else 0.0
+    out["calories"]=num(["calories","kcal"])
+    out["protein_g"]=num(["protein","protein_g"])
+    out["carbs_g"]=num(["carbs","carbohydrate"])
+    out["fat_g"]=num(["fat","fat_g"])
+    out["serving_grams"]=num(["serving_grams","grams"])
+    def per_gram(val,serv): return np.where(serv>0,val/serv,val/100.0)
+    out["kcal_per_g"]=per_gram(out["calories"],out["serving_grams"])
+    out["prot_per_g"]=per_gram(out["protein_g"],out["serving_grams"])
+    out["carb_per_g"]=per_gram(out["carbs_g"],out["serving_grams"])
+    out["fat_per_g"]=per_gram(out["fat_g"],out["serving_grams"])
     return out.reset_index(drop=True)
 
-def solve_quantities(selected_df, target_prot, target_carb, target_fat, max_gram_per_food=1000):
-    if selected_df.empty:
-        return np.array([])
-    A = np.vstack([
-        selected_df['prot_per_g'].to_numpy(),
-        selected_df['carb_per_g'].to_numpy(),
-        selected_df['fat_per_g'].to_numpy()
-    ]).T
-    b = np.array([target_prot,target_carb,target_fat],dtype=float)
-    res = lsq_linear(A,b,bounds=(0,max_gram_per_food))
-    return np.maximum(res.x,0.0)
+@st.cache_data
+def load_foods(file=None, path=DEFAULT_EXCEL):
+    if file: df=pd.read_excel(file, sheet_name=0)
+    elif os.path.exists(path): df=pd.read_excel(path, sheet_name=0)
+    else: return pd.DataFrame(columns=["name","brand","calories","protein_g","carbs_g","fat_g"])
+    return normalize_foods_df(df)
 
-def compute_meal_totals(selected_df, grams):
-    grams = np.array(grams)
-    kcal = (selected_df['kcal_per_g']*grams).sum()
-    prot = (selected_df['prot_per_g']*grams).sum()
-    carb = (selected_df['carb_per_g']*grams).sum()
-    fat = (selected_df['fat_per_g']*grams).sum()
-    return {'kcal':kcal,'protein_g':prot,'carbs_g':carb,'fat_g':fat}
+def calc_bmr(weight, height, age, sex):
+    if sex.lower().startswith("m"): return 10*weight+6.25*height-5*age+5
+    else: return 10*weight+6.25*height-5*age-161
+
+def activity_factor(level):
+    return {"Sedentary":1.2,"Light":1.375,"Moderate":1.55,"Active":1.725,"Very active":1.9}[level]
+
+def goal_adjust(cal,goal,week,total_weeks):
+    if goal=="Shred":
+        # gradually reduce
+        return cal*(1-0.1 - 0.1*(week/total_weeks))
+    if goal=="Gain" or goal=="Build muscle":
+        return cal*(1+0.1+0.05*(week/total_weeks))
+    if goal=="Performance": return cal*1.05
+    return cal
+
+def macro_split(weight,cal,style="Balanced"):
+    protein=1.8*weight
+    fat=(0.25*cal)/9
+    carbs=(cal-(protein*4+fat*9))/4
+    if style=="Low-carb": carbs=carbs*0.7; fat=(cal-(protein*4+carbs*4))/9
+    if style=="High-protein": protein=2.2*weight; carbs=(cal-(protein*4+fat*9))/4
+    return round(protein),round(carbs),round(fat)
+
+def solve_portions(df,prot,carb,fat):
+    if df.empty: return []
+    A=np.vstack([df["prot_per_g"],df["carb_per_g"],df["fat_per_g"]]).T
+    b=np.array([prot,carb,fat])
+    res=lsq_linear(A,b,bounds=(0,1000))
+    return np.round(res.x,1)
 
 # ---------- UI ----------
-st.set_page_config(page_title="TGK Meal Builder", layout="wide")
-st.title("TGK Meal Builder — Streamlit")
+st.set_page_config(page_title="TGK Weekly Nutrition Planner", layout="wide")
+st.title("TGK Weekly Nutrition Planner")
 
-uploaded_file = st.sidebar.file_uploader("Upload Excel food DB", type=["xlsx"])
-if uploaded_file:
-    foods = load_foods_from_fileobj(uploaded_file)
-else:
-    foods = load_foods_from_path(DEFAULT_EXCEL)
+# File
+uploaded=st.sidebar.file_uploader("Upload Excel food DB",type="xlsx")
+foods=load_foods(file=uploaded)
 
-st.sidebar.header("Targets")
-preset = st.sidebar.selectbox("Preset",["Manual","Breakfast (30C/23P/13F)","Lunch (35C/26P/9F)","Dinner (30C/20P/9F)","Snack (20C/20P/4F)"])
+# Client intake
+st.header("Client Intake")
+col1,col2,col3=st.columns(3)
+with col1:
+    name=st.text_input("Name","Client")
+    age=st.number_input("Age",18,80,30)
+    sex=st.selectbox("Sex",["Male","Female"])
+with col2:
+    height=st.number_input("Height (cm)",140,220,170)
+    weight=st.number_input("Weight (kg)",40,160,70)
+with col3:
+    activity=st.selectbox("Activity",["Sedentary","Light","Moderate","Active","Very active"])
+    goal=st.selectbox("Goal",["Shred","Maintain","Gain","Build muscle","Performance"])
+    style=st.selectbox("Diet style",["Balanced","High-protein","Low-carb","Plant-forward"])
+    weeks=st.number_input("Timeframe (weeks)",4,52,8)
 
-if "Breakfast" in preset: targets = (23,30,13)
-elif "Lunch" in preset: targets = (26,35,9)
-elif "Dinner" in preset: targets = (20,30,9)
-elif "Snack" in preset: targets = (20,20,4)
-else:
-    p=st.sidebar.number_input("Protein g",25.0); c=st.sidebar.number_input("Carbs g",30.0); f=st.sidebar.number_input("Fat g",13.0)
-    targets=(p,c,f)
+bmi=weight/((height/100)**2)
+bmr=calc_bmr(weight,height,age,sex)
+tdee=bmr*activity_factor(activity)
 
-st.header("1) Pick foods")
-search = st.text_input("Search")
-df=foods.copy()
-if search:
-    df=df[df['name'].str.contains(search,case=False,na=False)]
-st.dataframe(df[['name','brand','calories','protein_g','carbs_g','fat_g','serving_grams']].head(100))
+st.markdown(f"**BMI** {bmi:.1f}  |  **BMR** {bmr:.0f} kcal  |  **TDEE** {tdee:.0f} kcal")
 
-selected_idxs = st.multiselect(
-    "Select foods", 
-    options=list(df.index), 
-    format_func=lambda i: f"{df.loc[i,'name']} ({df.loc[i,'brand']})"
-)
-selected_df = df.loc[selected_idxs].reset_index(drop=True)
+# Preferences
+st.header("Food Preferences")
+excluded=st.multiselect("Exclude foods",list(foods["name"].unique()))
+favoured=st.multiselect("Favoured foods",list(foods["name"].unique()))
+filtered=foods[~foods["name"].isin(excluded)].reset_index(drop=True)
 
-st.header("2) Compute portions")
-if st.button("Compute") and not selected_df.empty:
-    grams = solve_quantities(selected_df,*targets)
-    selected_df['grams']=grams.round(1)
-    totals = compute_meal_totals(selected_df,grams)
-    disp = selected_df[['name','grams']].copy()
-    disp['kcal']=(selected_df['kcal_per_g']*grams).round(0)
-    disp['protein_g']=(selected_df['prot_per_g']*grams).round(1)
-    disp['carbs_g']=(selected_df['carb_per_g']*grams).round(1)
-    disp['fat_g']=(selected_df['fat_per_g']*grams).round(1)
-    st.dataframe(disp)
-    st.write("Totals:",totals)
-    csv_buf=io.StringIO();disp.to_csv(csv_buf,index=False)
-    st.download_button("Download CSV",csv_buf.getvalue(),"meal.csv","text/csv")
+# Plan
+st.header("Weekly Plan")
+meal_targets=[("Breakfast",0.25),("Lunch",0.3),("Dinner",0.3),("Snack",0.15)]
+
+weekly_plan={}
+for week in range(1,weeks+1):
+    week_days={}
+    cal=goal_adjust(tdee,goal,week,weeks)
+    prot,carb,fat=macro_split(weight,cal,style if style!="Plant-forward" else "Balanced")
+    for day in range(1,8):
+        day_meals={}
+        for meal,frac in meal_targets:
+            mp,mc,mf=int(prot*frac),int(carb*frac),int(fat*frac)
+            sub=filtered.sample(min(3,len(filtered)))  # random foods
+            grams=solve_portions(sub,mp,mc,mf)
+            sub["grams"]=grams
+            sub["kcal"]=(sub["kcal_per_g"]*grams).round(0)
+            sub["protein_g"]=(sub["prot_per_g"]*grams).round(1)
+            sub["carbs_g"]=(sub["carb_per_g"]*grams).round(1)
+            sub["fat_g"]=(sub["fat_per_g"]*grams).round(1)
+            day_meals[meal]=sub[["name","grams","kcal","protein_g","carbs_g","fat_g"]]
+        week_days[f"Day {day}"]=day_meals
+    weekly_plan[f"Week {week}"]=week_days
+
+# Display
+for week,days in weekly_plan.items():
+    with st.expander(week,expanded=False):
+        for day,meals in days.items():
+            st.subheader(f"{day}")
+            for meal,df in meals.items():
+                st.write(meal)
+                st.dataframe(df)
+
+# Export
+if st.button("Export CSV (Week 1)"):
+    out=[]
+    for day,meals in weekly_plan["Week 1"].items():
+        for meal,df in meals.items():
+            for _,row in df.iterrows():
+                out.append([day,meal,row["name"],row["grams"],row["kcal"],row["protein_g"],row["carbs_g"],row["fat_g"]])
+    outdf=pd.DataFrame(out,columns=["Day","Meal","Food","Grams","Kcal","Protein","Carbs","Fat"])
+    csv_buf=io.StringIO()
+    outdf.to_csv(csv_buf,index=False)
+    st.download_button("Download Week 1 CSV",csv_buf.getvalue(),"week1_plan.csv","text/csv")
